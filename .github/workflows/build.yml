@@ -1,0 +1,31 @@
+name: Build badblocks ARM32
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup NDK r21e
+        id: setup_ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r21e
+          local-cache: true
+
+      - name: Compile badblocks armeabi-v7a
+        run: |
+          export NDK=${{ steps.setup_ndk.outputs.ndk-path }}
+          export TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64
+          export CC=$TOOLCHAIN/bin/armv7a-linux-androideabi21-clang
+          $CC -O0 badblocks.c -o badblocks-armeabi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: badblocks-arm32
+          path: badblocks-armeabi
