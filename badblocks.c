@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <string.h>
+#include <linux/fs.h>
 
 #define BLK_SIZE 512
 static unsigned char wbuf[BLK_SIZE];
@@ -22,35 +23,82 @@ void init_pattern(void)
     memset(patterns[3], 0xaa, BLK_SIZE);
 }
 
-// 自动读取块设备 /sys/block/xxx/size
-// devname: /dev/block/mmcblk0p1
-// out_size: 返回总扇区（512B）
-int get_block_device_size(const char *devname, unsigned long long *out_size)
+// 简易提取mmcblkX 从 mmcblkXpY，不使用regex
+static int get_parent_dev(const char *part_name, char *parent_out)
+{
+    if (strstr(part_name, "mmcblk") != part_name)
+        return -1;
+    size_t i = 6;
+    while (part_name[i] != '\0' && part_name[i] != 'p')
+    {
+        parent_out[i] = part_name[i];
+        i++;
+    }
+    parent_out[i] = '\0';
+    if (i>0)
+        return 0;
+    return -1;
+}
+
+// 方式1：sysfs读取分区size（Android专用路径）
+static int get_size_via_sysfs(const char *devname, unsigned long long *out_sectors)
 {
     char sys_path[256];
-    char *p;
+    char part_name[128];
+    char parent_dev[128];
     const char *basename;
 
-    // 提取 mmcblk0p1 从 /dev/block/mmcblk0p1
     basename = strrchr(devname, '/');
     if(basename == NULL){
         basename = devname;
     }else{
         basename++;
     }
-    snprintf(sys_path, sizeof(sys_path), "/sys/block/%s/size", basename);
+    strncpy(part_name, basename, sizeof(part_name)-1);
+    part_name[sizeof(part_name)-1] = 0;
 
+    if(get_parent_dev(part_name, parent_dev) ==0)
+    {
+        snprintf(sys_path, sizeof(sys_path), "/sys/block/%s/%s/size", parent_dev, part_name);
+    }else{
+        snprintf(sys_path, sizeof(sys_path), "/sys/block/%s/size", part_name);
+    }
+    printf("[sysfs try] %s\n", sys_path);
     FILE *fp = fopen(sys_path, "r");
     if(!fp){
-        printf("Failed to open %s\n", sys_path);
         return -1;
     }
-    if(fscanf(fp, "%llu", out_size) !=1){
+    if(fscanf(fp, "%llu", out_sectors) !=1){
         fclose(fp);
         return -1;
     }
     fclose(fp);
     return 0;
+}
+
+// 方式2：IOCTL BLKGETSIZE64 兜底获取字节总容量，转成512扇区
+static int get_size_via_ioctl(int fd, unsigned long long *out_sectors)
+{
+    unsigned long long bytes = 0;
+    if (ioctl(fd, BLKGETSIZE64, &bytes) < 0)
+    {
+        printf("[ioctl] BLKGETSIZE64 failed, errno=%d\n", errno);
+        return -1;
+    }
+    *out_sectors = bytes / BLK_SIZE;
+    return 0;
+}
+
+// 统一入口：优先sysfs，失败自动切ioctl
+int get_block_device_size(const char *devname, int fd, unsigned long long *out_sectors)
+{
+    if(get_size_via_sysfs(devname, out_sectors) ==0)
+    {
+        printf("[OK] Read size from sysfs\n");
+        return 0;
+    }
+    printf("[warn] sysfs read failed, fallback to ioctl\n");
+    return get_size_via_ioctl(fd, out_sectors);
 }
 
 // 只读扫描
@@ -144,7 +192,7 @@ int main(int argc, char** argv)
         printf("Usage: %s dev_path start_block mode\n", argv[0]);
         printf("mode: 0=read-only safe scan, 1=destructive write test(DATA LOSS!)\n");
         printf("Example: %s /dev/block/mmcblk0p1 0 0\n", argv[0]);
-        printf("Auto read partition size, no need input end_block\n");
+        printf("Auto read partition size(sysfs + ioctl fallback)\n");
         return 1;
     }
     const char *dev = argv[1];
@@ -152,10 +200,18 @@ int main(int argc, char** argv)
     int mode = atoi(argv[3]);
     unsigned long long dev_sectors;
 
-    // 自动读取分区总扇区
-    if(get_block_device_size(dev, &dev_sectors) !=0)
+    int fd = open(dev, O_RDONLY);
+    if(fd < 0)
     {
-        printf("Get block size failed!\n");
+        printf("Open %s failed, errno=%d, need root!\n", dev, errno);
+        return -1;
+    }
+
+    // 传入fd，sysfs失败自动用ioctl
+    if(get_block_device_size(dev, fd, &dev_sectors) !=0)
+    {
+        printf("Get block size failed! sysfs and ioctl both failed.\n");
+        close(fd);
         return -1;
     }
     unsigned long long end = dev_sectors -1;
@@ -165,19 +221,21 @@ int main(int argc, char** argv)
     if(start > end)
     {
         printf("Error: start_block > end_block\n");
+        close(fd);
         return -1;
     }
 
-    int fd = open(dev, O_RDONLY);
+    // 如果是写模式，重新打开读写句柄
     if(mode == 1)
     {
+        close(fd);
         fd = open(dev, O_RDWR);
+        if(fd <0){
+            printf("Open O_RDWR failed, cannot do write test\n");
+            return -1;
+        }
     }
-    if(fd < 0)
-    {
-        printf("Open %s failed, errno=%d, need root!\n", dev, errno);
-        return -1;
-    }
+
     init_pattern();
     int bad_blocks =0;
     printf("badblocks start. dev:%s, mode=%s\n",
