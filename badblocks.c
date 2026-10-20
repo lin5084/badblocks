@@ -139,7 +139,7 @@ int write_test(int fd, unsigned long long start_blk, unsigned long long end_blk)
 
 int main(int argc, char** argv)
 {
-    if(argc !=3)
+    if(argc !=4)
     {
         printf("Usage: %s dev_path start_block mode\n", argv[0]);
         printf("mode: 0=read-only safe scan, 1=destructive write test(DATA LOSS!)\n");
